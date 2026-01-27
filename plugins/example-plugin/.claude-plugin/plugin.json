@@ -1,0 +1,8 @@
+{
+  "name": "example-plugin",
+  "description": "示例插件，展示插件开发的基本结构和规范",
+  "version": "1.0.0",
+  "author": {
+    "name": "Finance Skill Marketplace"
+  }
+}
