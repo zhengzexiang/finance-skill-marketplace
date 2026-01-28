@@ -1,0 +1,8 @@
+{
+  "name": "etf-analysis",
+  "description": "ETF/股票全方位分析工具：行情、溢价率、技术指标、市场情绪、持仓明细、行业配置、资金流向、规模、分红、评级、新闻快讯、涨停板、人气榜、龙虎榜、大盘资金、市场估值、综合评分、研报、业绩预告。数据源：AkShare + BaoStock",
+  "version": "0.0.1",
+  "author": {
+    "name": "Finance Skill Marketplace"
+  }
+}

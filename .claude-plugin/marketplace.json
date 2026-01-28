@@ -3,5 +3,12 @@
   "owner": {
     "name": "Finance Skill Marketplace"
   },
-  "plugins": []
+  "plugins": [
+    {
+      "name": "etf-analysis",
+      "source": "./plugins/etf-analysis",
+      "description": "ETF/股票全方位分析工具：行情、溢价率、技术指标、市场情绪、持仓、资金流向、涨停板、龙虎榜、新闻、研报、业绩预告。数据源：AkShare + BaoStock",
+      "version": "0.0.1"
+    }
+  ]
 }
