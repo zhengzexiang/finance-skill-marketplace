@@ -61,6 +61,15 @@ def resolve_etf_code(code_or_name: str) -> str:
     return code_or_name
 
 
+def is_etf_code(code: str) -> bool:
+    """判断代码是否为 ETF（而非股票）"""
+    # ETF 代码特征：51xxxx (上证), 15xxxx/16xxxx (深证), 58xxxx (科创板ETF)
+    code = code.strip()
+    if len(code) != 6:
+        return False
+    return code.startswith(('51', '15', '16', '58'))
+
+
 def get_last_quarter() -> tuple[int, int]:
     """获取上一季度的年份和季度"""
     now = datetime.now()
@@ -261,14 +270,17 @@ class AkShareSource:
         if df.empty:
             return df
 
-        # 过滤只保留最新季度的数据 (API 返回按时间顺序，最新在最后)
+        # 过滤只保留最新季度的数据
         if "季度" in df.columns:
-            latest_quarter = df["季度"].iloc[-1]
+            # 按季度文本排序取最大值（如 "2025年4季度" > "2025年1季度"）
+            latest_quarter = df["季度"].max()
             df = df[df["季度"] == latest_quarter].copy()
 
         result = df[["序号", "股票代码", "股票名称", "占净值比例", "持股数", "持仓市值"]].copy()
+        # 重新生成序号从 1 开始
+        result["序号"] = range(1, len(result) + 1)
         if "季度" in df.columns:
-            result["季度"] = df["季度"].iloc[0] if not df.empty else ""
+            result["季度"] = latest_quarter
         return result
 
     @staticmethod
@@ -704,6 +716,356 @@ class AkShareSource:
             result["报告名称"] = result["报告名称"].apply(lambda x: x[:40] + "..." if len(str(x)) > 40 else x)
 
         return result.head(limit).reset_index(drop=True)
+
+    @staticmethod
+    def get_chip_distribution(code: str, adjust: str = "", limit: int = 30) -> pd.DataFrame:
+        """
+        获取股票筹码分布数据
+
+        Args:
+            code: 股票代码 (如 000001, 600519)
+            adjust: 复权类型 ("qfq": 前复权, "hfq": 后复权, "": 不复权)
+            limit: 返回最近 N 天数据
+
+        Returns:
+            DataFrame 包含: 日期, 获利比例, 平均成本, 90成本区间, 70成本区间, 集中度等
+        """
+        try:
+            df = ak.stock_cyq_em(symbol=code, adjust=adjust)
+            if df.empty:
+                return df
+
+            # 重命名列使其更易读
+            rename_map = {
+                "日期": "日期",
+                "获利比例": "获利比例",
+                "平均成本": "平均成本",
+                "90成本-低": "90成本低",
+                "90成本-高": "90成本高",
+                "90集中度": "90集中度",
+                "70成本-低": "70成本低",
+                "70成本-高": "70成本高",
+                "70集中度": "70集中度",
+            }
+            df = df.rename(columns=rename_map)
+
+            # 格式化数值
+            if "获利比例" in df.columns:
+                df["获利比例"] = df["获利比例"].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "-")
+            if "90集中度" in df.columns:
+                df["90集中度"] = df["90集中度"].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "-")
+            if "70集中度" in df.columns:
+                df["70集中度"] = df["70集中度"].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "-")
+
+            # 保留小数点后两位
+            for col in ["平均成本", "90成本低", "90成本高", "70成本低", "70成本高"]:
+                if col in df.columns:
+                    df[col] = df[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+
+            # 返回最近 N 天数据
+            return df.tail(limit).reset_index(drop=True)
+
+        except Exception as e:
+            # 返回空 DataFrame 并在调用处处理错误
+            return pd.DataFrame()
+
+    @staticmethod
+    def interpret_chip_distribution(df: pd.DataFrame) -> list[str]:
+        """
+        解读筹码分布数据
+
+        Args:
+            df: 筹码分布数据
+
+        Returns:
+            解读信号列表
+        """
+        signals = []
+        if df.empty:
+            return signals
+
+        try:
+            latest = df.iloc[-1]
+
+            # 解析获利比例 (去掉百分号)
+            profit_ratio_str = latest.get("获利比例", "0%")
+            profit_ratio = float(profit_ratio_str.rstrip("%")) if isinstance(profit_ratio_str, str) else profit_ratio_str
+
+            # 解析集中度
+            concentration_90_str = latest.get("90集中度", "0%")
+            concentration_90 = float(concentration_90_str.rstrip("%")) if isinstance(concentration_90_str, str) else concentration_90_str
+
+            concentration_70_str = latest.get("70集中度", "0%")
+            concentration_70 = float(concentration_70_str.rstrip("%")) if isinstance(concentration_70_str, str) else concentration_70_str
+
+            # 获利比例分析
+            if profit_ratio >= 90:
+                signals.append(f"🔴 获利盘极高 ({profit_ratio:.1f}%)，注意追高风险")
+            elif profit_ratio >= 70:
+                signals.append(f"🟠 获利盘较高 ({profit_ratio:.1f}%)，短期可能有抛压")
+            elif profit_ratio <= 10:
+                signals.append(f"🟢 获利盘极低 ({profit_ratio:.1f}%)，套牢盘重，可能接近底部")
+            elif profit_ratio <= 30:
+                signals.append(f"🟡 获利盘较低 ({profit_ratio:.1f}%)，多数持仓处于亏损状态")
+
+            # 集中度分析 (90% 筹码集中度)
+            if concentration_90 <= 10:
+                signals.append(f"📊 筹码高度集中 (90集中度: {concentration_90:.1f}%)，主力控盘明显")
+            elif concentration_90 <= 20:
+                signals.append(f"📊 筹码较为集中 (90集中度: {concentration_90:.1f}%)")
+            elif concentration_90 >= 50:
+                signals.append(f"📊 筹码分散 (90集中度: {concentration_90:.1f}%)，缺乏主力资金")
+
+            # 计算趋势 (如果有多天数据)
+            if len(df) >= 5:
+                recent_profit = []
+                for i in range(-5, 0):
+                    val_str = df.iloc[i].get("获利比例", "0%")
+                    val = float(val_str.rstrip("%")) if isinstance(val_str, str) else val_str
+                    recent_profit.append(val)
+
+                if all(recent_profit[i] < recent_profit[i+1] for i in range(len(recent_profit)-1)):
+                    signals.append("⬆️ 获利比例持续上升，股价可能在上涨")
+                elif all(recent_profit[i] > recent_profit[i+1] for i in range(len(recent_profit)-1)):
+                    signals.append("⬇️ 获利比例持续下降，股价可能在下跌")
+
+        except Exception:
+            pass
+
+        return signals
+
+    @staticmethod
+    def plot_chip_distribution_ascii(df: pd.DataFrame, name: str = "", code: str = "") -> str:
+        """
+        绘制 ASCII 筹码分布图
+
+        Args:
+            df: 筹码分布数据
+            name: 股票名称
+            code: 股票代码
+
+        Returns:
+            ASCII 图表字符串
+        """
+        if df.empty:
+            return "无数据"
+
+        lines = []
+        width = 50  # 图表宽度
+
+        # 标题
+        title = f"{name} ({code}) 筹码分布图" if name else "筹码分布图"
+        lines.append(f"\n{'=' * 60}")
+        lines.append(f"  {title}")
+        lines.append(f"{'=' * 60}")
+
+        # 解析数据
+        try:
+            dates = df["日期"].tolist()
+            profits = []
+            costs = []
+            cost_90_lows = []
+            cost_90_highs = []
+
+            for _, row in df.iterrows():
+                # 获利比例
+                p_str = row.get("获利比例", "0%")
+                p = float(p_str.rstrip("%")) if isinstance(p_str, str) else float(p_str)
+                profits.append(p)
+
+                # 平均成本
+                c_str = row.get("平均成本", "0")
+                c = float(c_str) if isinstance(c_str, str) else float(c_str)
+                costs.append(c)
+
+                # 90% 成本区间
+                low_str = row.get("90成本低", "0")
+                high_str = row.get("90成本高", "0")
+                cost_90_lows.append(float(low_str) if isinstance(low_str, str) else float(low_str))
+                cost_90_highs.append(float(high_str) if isinstance(high_str, str) else float(high_str))
+
+            # 1. 获利比例趋势图
+            lines.append(f"\n📈 获利比例趋势 (最近 {len(profits)} 天)")
+            lines.append("-" * 60)
+
+            max_profit = max(profits) if max(profits) > 0 else 1
+            for i, (date, profit) in enumerate(zip(dates, profits)):
+                bar_len = int((profit / max(max_profit, 1)) * width) if max_profit > 0 else 0
+                bar = "█" * bar_len + "░" * (width - bar_len)
+                date_str = str(date)[-5:] if len(str(date)) > 5 else str(date)
+                lines.append(f"  {date_str} │{bar}│ {profit:.2f}%")
+
+            # 2. 成本区间分布
+            lines.append(f"\n📊 成本区间分布")
+            lines.append("-" * 60)
+
+            # 取最新数据
+            latest = df.iloc[-1]
+            avg_cost = costs[-1]
+            low_90 = cost_90_lows[-1]
+            high_90 = cost_90_highs[-1]
+
+            low_70_str = latest.get("70成本低", "0")
+            high_70_str = latest.get("70成本高", "0")
+            low_70 = float(low_70_str) if isinstance(low_70_str, str) else float(low_70_str)
+            high_70 = float(high_70_str) if isinstance(high_70_str, str) else float(high_70_str)
+
+            # 计算价格范围
+            price_min = low_90 * 0.98
+            price_max = high_90 * 1.02
+            price_range = price_max - price_min
+
+            def price_to_pos(price):
+                if price_range == 0:
+                    return 0
+                return int(((price - price_min) / price_range) * width)
+
+            # 绘制成本分布条
+            lines.append(f"  价格区间: {price_min:.2f} - {price_max:.2f}")
+            lines.append("")
+
+            # 90% 成本区间
+            pos_90_low = price_to_pos(low_90)
+            pos_90_high = price_to_pos(high_90)
+            bar_90 = " " * pos_90_low + "▓" * (pos_90_high - pos_90_low) + " " * (width - pos_90_high)
+            lines.append(f"  90%筹码 │{bar_90}│ {low_90:.2f}-{high_90:.2f}")
+
+            # 70% 成本区间
+            pos_70_low = price_to_pos(low_70)
+            pos_70_high = price_to_pos(high_70)
+            bar_70 = " " * pos_70_low + "█" * (pos_70_high - pos_70_low) + " " * (width - pos_70_high)
+            lines.append(f"  70%筹码 │{bar_70}│ {low_70:.2f}-{high_70:.2f}")
+
+            # 平均成本标记
+            pos_avg = price_to_pos(avg_cost)
+            bar_avg = " " * pos_avg + "◆" + " " * (width - pos_avg - 1)
+            lines.append(f"  平均成本 │{bar_avg}│ {avg_cost:.2f}")
+
+            # 3. 集中度趋势
+            lines.append(f"\n📉 筹码集中度")
+            lines.append("-" * 60)
+
+            conc_90_str = latest.get("90集中度", "0%")
+            conc_70_str = latest.get("70集中度", "0%")
+            conc_90 = float(conc_90_str.rstrip("%")) if isinstance(conc_90_str, str) else float(conc_90_str)
+            conc_70 = float(conc_70_str.rstrip("%")) if isinstance(conc_70_str, str) else float(conc_70_str)
+
+            lines.append(f"  90% 集中度: {conc_90:.2f}% {'(高度集中)' if conc_90 < 15 else '(较分散)' if conc_90 > 30 else ''}")
+            lines.append(f"  70% 集中度: {conc_70:.2f}% {'(高度集中)' if conc_70 < 10 else '(较分散)' if conc_70 > 20 else ''}")
+
+            lines.append(f"\n{'=' * 60}")
+
+        except Exception as e:
+            lines.append(f"绘图错误: {e}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def get_etf_holdings_chip_summary(etf_code: str, top_n: int = 5) -> str:
+        """
+        获取 ETF 前 N 大重仓股的筹码分布汇总
+
+        Args:
+            etf_code: ETF 代码
+            top_n: 获取前 N 大重仓股 (默认 5)
+
+        Returns:
+            格式化的筹码分布汇总字符串
+        """
+        lines = []
+
+        try:
+            # 获取 ETF 持仓 (尝试最近几年的数据)
+            holding_df = pd.DataFrame()
+            current_year = datetime.now().year
+            for year in range(current_year, current_year - 3, -1):
+                holding_df = AkShareSource.get_etf_holding(etf_code, str(year))
+                if not holding_df.empty:
+                    break
+
+            if holding_df.empty:
+                return f"未找到 {etf_code} 的持仓数据"
+
+            # 获取 ETF 名称
+            try:
+                spot_df = AkShareSource.get_etf_spot()
+                etf_row = spot_df[spot_df["代码"] == etf_code]
+                etf_name = etf_row["名称"].iloc[0] if not etf_row.empty else etf_code
+            except Exception:
+                etf_name = etf_code
+
+            lines.append(f"\n{'=' * 70}")
+            lines.append(f"  {etf_name} ({etf_code}) 重仓股筹码分布")
+            lines.append(f"{'=' * 70}")
+
+            # 获取季度信息
+            quarter = holding_df["季度"].iloc[0] if "季度" in holding_df.columns else ""
+            if quarter:
+                lines.append(f"  持仓季度: {quarter}")
+
+            # 遍历前 N 大重仓股
+            top_holdings = holding_df.head(top_n)
+            lines.append(f"\n  前 {len(top_holdings)} 大重仓股筹码情况:")
+            lines.append("-" * 70)
+            lines.append(f"  {'序号':<4} {'股票':<12} {'占比':<8} {'获利盘':<10} {'平均成本':<12} {'集中度':<10} {'信号'}")
+            lines.append("-" * 70)
+
+            for _, row in top_holdings.iterrows():
+                stock_code = str(row["股票代码"]).strip()
+                stock_name = str(row["股票名称"])[:6]  # 截断名称
+                weight = row["占净值比例"]
+
+                # 处理股票代码格式 (可能带市场前缀)
+                if "." in stock_code:
+                    stock_code = stock_code.split(".")[-1]
+                stock_code = stock_code.zfill(6)
+
+                # 获取该股票的筹码分布 (只取最新 1 天)
+                try:
+                    cyq_df = AkShareSource.get_chip_distribution(stock_code, "", 1)
+                    if not cyq_df.empty:
+                        latest = cyq_df.iloc[-1]
+
+                        # 解析数据
+                        profit_str = latest.get("获利比例", "0%")
+                        profit = float(profit_str.rstrip("%")) if isinstance(profit_str, str) else float(profit_str)
+
+                        avg_cost_str = latest.get("平均成本", "0")
+                        avg_cost = float(avg_cost_str) if isinstance(avg_cost_str, str) else float(avg_cost_str)
+
+                        conc_str = latest.get("90集中度", "0%")
+                        conc = float(conc_str.rstrip("%")) if isinstance(conc_str, str) else float(conc_str)
+
+                        # 判断信号
+                        if profit >= 80:
+                            signal = "🔴 高位"
+                        elif profit >= 50:
+                            signal = "🟡 中位"
+                        elif profit <= 10:
+                            signal = "🟢 低位"
+                        else:
+                            signal = "⚪ 正常"
+
+                        lines.append(f"  {row['序号']:<4} {stock_name:<10} {weight:<8} {profit:>6.2f}%    {avg_cost:>10.2f}  {conc:>6.2f}%     {signal}")
+                    else:
+                        lines.append(f"  {row['序号']:<4} {stock_name:<10} {weight:<8} {'--':>8}    {'--':>10}  {'--':>8}     ⚫ 无数据")
+                except Exception:
+                    lines.append(f"  {row['序号']:<4} {stock_name:<10} {weight:<8} {'--':>8}    {'--':>10}  {'--':>8}     ⚫ 无数据")
+
+            lines.append("-" * 70)
+
+            # 汇总分析
+            lines.append(f"\n💡 汇总:")
+            lines.append(f"  🔴 高位(获利盘>80%): 追高风险较大")
+            lines.append(f"  🟡 中位(50-80%): 筹码适中")
+            lines.append(f"  🟢 低位(获利盘<10%): 套牢盘重，可能接近底部")
+
+            lines.append(f"\n{'=' * 70}")
+
+        except Exception as e:
+            lines.append(f"获取数据错误: {e}")
+
+        return "\n".join(lines)
 
 
 # ============================================================================
@@ -2034,6 +2396,27 @@ def main():
         help="输出格式",
     )
 
+    # cyq 命令 - 筹码分布
+    cyq_parser = subparsers.add_parser("cyq", help="筹码分布 (获利盘/成本分布/集中度)")
+    cyq_parser.add_argument("code", type=str, help="股票/ETF 代码 (如 000001, 600519, 510050)")
+    cyq_parser.add_argument(
+        "--adjust",
+        type=str,
+        default="",
+        choices=["", "qfq", "hfq"],
+        help="复权类型: 空-不复权, qfq-前复权, hfq-后复权",
+    )
+    cyq_parser.add_argument("--limit", type=int, default=30, help="返回最近 N 天数据 (默认 30)")
+    cyq_parser.add_argument("--plot", action="store_true", help="显示 ASCII 图表")
+    cyq_parser.add_argument("--top", type=int, default=5, help="ETF 模式: 显示前 N 大重仓股筹码 (默认 5)")
+    cyq_parser.add_argument(
+        "--format",
+        type=str,
+        default="table",
+        choices=["table", "json", "csv"],
+        help="输出格式",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -2420,6 +2803,44 @@ def main():
                 sys.exit(1)
             print(f"\n💵 {code} 分红历史")
             print(format_output(df, args.format))
+
+        elif args.command == "cyq":
+            code = resolve_etf_code(args.code)
+
+            # 检测是否为 ETF
+            if is_etf_code(code):
+                # ETF 模式：显示重仓股筹码分布汇总
+                summary = AkShareSource.get_etf_holdings_chip_summary(code, args.top)
+                print(summary)
+            else:
+                # 股票模式：显示单只股票筹码分布
+                df = AkShareSource.get_chip_distribution(code, args.adjust, args.limit)
+                if df.empty:
+                    print(f"未找到 {code} 的筹码分布数据 (仅支持 A 股)", file=sys.stderr)
+                    sys.exit(1)
+
+                # 获取股票名称
+                try:
+                    stock_info = ak.stock_individual_info_em(symbol=code)
+                    name = stock_info[stock_info["item"] == "股票简称"]["value"].iloc[0] if not stock_info.empty else code
+                except Exception:
+                    name = code
+
+                if args.plot:
+                    # 显示 ASCII 图表
+                    chart = AkShareSource.plot_chip_distribution_ascii(df, name, code)
+                    print(chart)
+                else:
+                    # 显示表格数据
+                    print(f"\n📊 {name} ({code}) 筹码分布 (最近 {len(df)} 天)")
+                    print(format_output(df, args.format))
+
+                # 显示解读
+                signals = AkShareSource.interpret_chip_distribution(df)
+                if signals:
+                    print("\n💡 筹码解读:")
+                    for sig in signals:
+                        print(f"  {sig}")
 
     except Exception as e:
         print(f"错误: {e}", file=sys.stderr)
